@@ -22,6 +22,7 @@
 #include <linux/futex.h>
 #include <present.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <dri3.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
@@ -1177,12 +1178,40 @@ static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_
 
 static dri3_screen_info_rec lorieDri3Info = {
         .version = 2,
+        .open = lorieDri3Open,
         .fds_from_pixmap = FalseNoop,
         .pixmap_from_fds = loriePixmapFromFds,
         .get_formats = lorieGetFormats,
         .get_modifiers = lorieGetModifiers,
         .get_drawable_modifiers = FalseNoop
 };
+
+/*
+ * Experimental: upstream Xorg's DRI3 dispatcher returns BadMatch when neither
+ * info->open_client nor info->open is set (dri3/dri3_screen.c). Lorie leaves
+ * both unset, so every client doing xcb_dri3_open() fails with BadMatch and the
+ * proprietary Adreno EGL subdriver falls back to its (broken) CPU copy path.
+ *
+ * This hook hands the client a real DRM render node fd so the driver can move
+ * on to DRI3PixmapFromBuffer; the import side (loriePixmapFromFds) already
+ * accepts a raw mmappable dma-buf. Untested and only a starting point.
+ */
+static int lorieDri3Open(unused ScreenPtr screen, unused RRProviderPtr provider, int *fd) {
+    const char *path = getenv("LORIE_DRI3_DEVICE");
+    int f;
+
+    if (path == NULL)
+        path = "/dev/dri/renderD128";
+
+    f = open(path, O_RDWR | O_CLOEXEC);
+    if (f < 0) {
+        log(ERROR, "DRI3: failed to open %s: %s", path, strerror(errno));
+        return BadAlloc;
+    }
+
+    *fd = f;
+    return Success;
+}
 
 static GLboolean drawableSwapBuffers(unused ClientPtr client, unused __GLXdrawable * drawable) { return TRUE; }
 static void drawableCopySubBuffer(unused __GLXdrawable * basePrivate, unused int x, unused int y, unused int w, unused int h) {}
