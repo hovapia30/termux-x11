@@ -23,6 +23,8 @@
 #include <present.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 #include <dri3.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
@@ -109,6 +111,15 @@ typedef struct {
     bool flipped, wasLocked, imported;
     void *locked;
     void *mem;
+    // Some DRI3 clients (notably the proprietary Adreno Vulkan driver) hand over
+    // raw dma-bufs that are 16 bpp (R5G6B5) while claiming a 24-bit depth. Xorg
+    // can not represent such a pixmap, so we keep the source mapping around and
+    // expand it to 32 bpp into a regular LorieBuffer before anyone reads it.
+    void *srcData;   // mmap()ed source, NULL for ordinary pixmaps
+    size_t srcSize;  // size of the mapping
+    int srcFd;       // duplicated source fd (needed for DMA_BUF_IOCTL_SYNC)
+    int32_t srcStride; // bytes per source row
+    int32_t srcWidth, srcHeight;
 } LoriePixmapPriv;
 
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap)) : NULL)
@@ -1002,6 +1013,7 @@ void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unu
     priv = calloc(1, size);
     if (!priv)
         return NULL;
+    priv->srcFd = -1;
 
     if (width == 0 || height == 0)
         return priv;
@@ -1027,6 +1039,10 @@ void lorieExaDestroyPixmap(__unused ScreenPtr pScreen, void *driverPriv) {
         lorieUnregisterBuffer(priv->buffer);
         LorieBuffer_release(priv->buffer);
     }
+    if (priv->srcData)
+        munmap(priv->srcData, priv->srcSize);
+    if (priv->srcFd >= 0)
+        close(priv->srcFd);
     free(priv);
 }
 
@@ -1035,6 +1051,47 @@ Bool lorieModifyPixmapHeader(PixmapPtr pPix, __unused int w, __unused int h, __u
     if (priv && data)
         priv->mem = data;
     return FALSE;
+}
+
+// Expand a 16 bpp RGB565 source to the 32 bpp B8G8R8X8 destination.
+// The source is an mmap()ed dma-buf sent by a DRI3 client; without
+// DMA_BUF_IOCTL_SYNC the CPU reads stale (zero) data.
+static void lorieExpand565To8888(LoriePixmapPriv *priv) {
+    const LorieBuffer_Desc *desc;
+    uint32_t *dst;
+    const uint16_t *src;
+
+    if (!priv->srcData || !priv->buffer)
+        return;
+
+    desc = LorieBuffer_description(priv->buffer);
+    dst = priv->locked ?: priv->mem;
+    if (!dst || desc->stride < priv->srcWidth)
+        return;
+
+    if (priv->srcFd >= 0) {
+        struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+        ioctl(priv->srcFd, DMA_BUF_IOCTL_SYNC, &sync);
+    }
+
+    src = priv->srcData;
+    for (int y = 0; y < priv->srcHeight; y++) {
+        const uint16_t *s = (const uint16_t *) ((const uint8_t *) src + (size_t) y * priv->srcStride);
+        uint32_t *d = dst + (size_t) y * desc->stride;
+        for (int x = 0; x < priv->srcWidth; x++) {
+            uint32_t v = s[x];
+            uint32_t r = (v >> 11) & 0x1f, g = (v >> 5) & 0x3f, b = v & 0x1f;
+            r = (r << 3) | (r >> 2);
+            g = (g << 2) | (g >> 4);
+            b = (b << 3) | (b >> 2);
+            d[x] = 0xff000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+
+    if (priv->srcFd >= 0) {
+        struct dma_buf_sync end = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
+        ioctl(priv->srcFd, DMA_BUF_IOCTL_SYNC, &end);
+    }
 }
 
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
@@ -1053,6 +1110,10 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
         priv->wasLocked = TRUE;
 
     pPix->devPrivate.ptr = priv->locked ?: priv->mem;
+
+    if (priv->srcData)
+        lorieExpand565To8888(priv);
+
     return TRUE;
 }
 
@@ -1107,7 +1168,7 @@ static LorieBuffer *lorieReceiveSocketBuffer(int fd, AHardwareBuffer_Desc *desc)
 }
 
 static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *fds, CARD16 width, CARD16 height,
-                                    const CARD32 *strides, const CARD32 *offsets, CARD8 depth, __unused CARD8 bpp, CARD64 modifier) {
+                                    const CARD32 *strides, const CARD32 *offsets, CARD8 depth, CARD8 bpp, CARD64 modifier) {
 #define fail(msg, ...) do { log(ERROR, msg, ##__VA_ARGS__); goto fail; } while(0)
 #define check(cond, msg, ...) if ((cond)) fail(msg, ##__VA_ARGS__)
     const CARD64 AHARDWAREBUFFER_SOCKET_FD = 1255;
@@ -1130,6 +1191,27 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
     priv->imported = true;
 
     if (modifier == DRM_FORMAT_MOD_INVALID || modifier == DRM_FORMAT_MOD_LINEAR || modifier == RAW_MMAPPABLE_FD) {
+        if (bpp == 16) {
+            // Some DRI3 clients (the proprietary Adreno Vulkan WSI among them)
+            // hand over 16 bpp RGB565 buffers even for a 24-bit depth, which
+            // Xorg cannot represent. Keep the source mapping around and expand
+            // it to 32 bpp into a regular buffer on every CPU access.
+            size_t srcSize = (size_t) strides[0] * height;
+            void *src = mmap(NULL, srcSize, PROT_READ, MAP_SHARED, fds[0], offsets[0]);
+            if (src == MAP_FAILED)
+                fail("DRI3: mmap of 16bpp buffer failed: %s", strerror(errno));
+            priv->srcData = src;
+            priv->srcSize = srcSize;
+            priv->srcFd = dup(fds[0]);
+            priv->srcStride = strides[0];
+            priv->srcWidth = width;
+            priv->srcHeight = height;
+            check(!(priv->buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, LORIEBUFFER_REGULAR)), "DRI3: LorieBuffer_allocate failed.");
+            screen->ModifyPixmapHeader(pixmap, width, height, 0, 0, width * 4, NULL);
+            if (lorieServerDebugEnabled)
+                log(INFO, "DRI3: imported raw 16bpp fd, modifier %llu, %ux%u stride %u, expanding to 32bpp", (unsigned long long) modifier, width, height, strides[0]);
+            return pixmap;
+        }
         check(!(priv->buffer = LorieBuffer_wrapFileDescriptor(width, strides[0]/4, height, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, fds[0], offsets[0])), "DRI3: LorieBuffer_wrapAHardwareBuffer failed.");
         screen->ModifyPixmapHeader(pixmap, width, height, 0, 0, strides[0], NULL);
         if (lorieServerDebugEnabled)
@@ -1175,6 +1257,8 @@ static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_
     *modifiers = &modifier;
     return TRUE;
 }
+
+static int lorieDri3Open(unused ScreenPtr screen, unused RRProviderPtr provider, int *fd);
 
 static dri3_screen_info_rec lorieDri3Info = {
         .version = 2,
