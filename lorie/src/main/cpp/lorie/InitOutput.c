@@ -960,9 +960,11 @@ Bool loriePresentFlip(__unused RRCrtcPtr crtc, __unused uint64_t event_id, __unu
         return FALSE;
 
     const LorieBuffer_Desc *desc = LorieBuffer_description(priv->buffer);
-    char *forceFlip = getenv("TERMUX_X11_FORCE_FLIP");
-    if (desc->type == LORIEBUFFER_FD && priv->imported && !(forceFlip && strcmp(forceFlip, "1") == 0))
-        return FALSE; // For some reason it does not work fine with turnip.
+    // Allow a direct flip of imported FD buffers (DRI3 DMABUF). The previous
+    // restriction (requiring TERMUX_X11_FORCE_FLIP=1) was a workaround for
+    // Turnip; the proprietary Adreno driver handles a direct flip fine, and
+    // without it Present copies the buffer instead of flipping it, which
+    // hurts the frame rate badly.
 
     // Regular buffers can not be shared to activity, we must explicitly convert LorieBuffer to FD or AHardwareBuffer
     lorieEnsureGpuSampleable(pixmap, pvfb->root.legacyDrawing ? LORIEBUFFER_FD : LORIEBUFFER_AHARDWAREBUFFER);
