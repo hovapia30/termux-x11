@@ -25,7 +25,6 @@ static __GLXconfig *lorieGlxConfigs(void) {
         {{8, 8, 8, 0}, {16, 8, 0, -1}, 0, GLX_WINDOW_BIT | GLX_PIXMAP_BIT | GLX_PBUFFER_BIT},
         {{8, 8, 8, 8}, {16, 8, 0, 24}, 1, GLX_WINDOW_BIT | GLX_PIXMAP_BIT | GLX_PBUFFER_BIT},
         {{8, 8, 8, 0}, {16, 8, 0, -1}, 1, GLX_WINDOW_BIT | GLX_PIXMAP_BIT | GLX_PBUFFER_BIT},
-        {{5, 6, 5, 0}, {11, 5, 0, -1}, 0, GLX_WINDOW_BIT | GLX_PIXMAP_BIT | GLX_PBUFFER_BIT},
     };
     static const ZsFormat zsFormats[] = {{0, 0}, {16, 0}, {24, 0}, {24, 8}, {32, 0}};
     static const BufferMode bufferModes[] = {{0, 0}, {1, 0}, {1, 1}};

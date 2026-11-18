@@ -878,8 +878,13 @@ void lorieConfigureNotify(int width, int height, int framerate, size_t name_size
 }
 
 void InitOutput(ScreenInfo * screen_info, int argc, char **argv) {
-    int depths[] = { 1, 4, 8, 15, 16, 24, 32 };
-    int bpp[] =    { 1, 8, 8, 16, 16, 32, 32 };
+    // Do not advertise 15/16-bit pixmap formats or visuals. The root screen is
+    // 24-bit TrueColor backed by a 32 bpp framebuffer, and advertising 16-bit
+    // modes makes some clients (e.g. Vulkan WSI on Adreno) pick RGB565 DRI3
+    // buffers which then hit the CPU 565->8888 import path. Restricting to
+    // 1/4/8/24/32 keeps 32 bpp as the only TrueColor choice for such clients.
+    int depths[] = { 1, 4, 8, 24, 32 };
+    int bpp[] =    { 1, 8, 8, 32, 32 };
     int i;
 
     if (monitorResolution == 0)
@@ -1210,13 +1215,15 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
             priv->srcData = src;
             priv->srcSize = srcSize;
             priv->srcFd = dup(fds[0]);
-            priv->srcStride = strides[0];
+            priv->srcStride = (int32_t) strides[0];
             priv->srcWidth = width;
             priv->srcHeight = height;
             check(!(priv->buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, LORIEBUFFER_REGULAR)), "DRI3: LorieBuffer_allocate failed.");
-            screen->ModifyPixmapHeader(pixmap, width, height, 0, 0, width * 4, NULL);
-            if (lorieServerDebugEnabled)
-                log(INFO, "DRI3: imported raw 16bpp fd, modifier %llu, %ux%u stride %u, expanding to 32bpp", (unsigned long long) modifier, width, height, strides[0]);
+            {
+                const LorieBuffer_Desc *dstDesc = LorieBuffer_description(priv->buffer);
+                int devKind = dstDesc ? (int) dstDesc->stride * 4 : width * 4;
+                screen->ModifyPixmapHeader(pixmap, width, height, 0, 0, devKind, NULL);
+            }
             return pixmap;
         }
         check(!(priv->buffer = LorieBuffer_wrapFileDescriptor(width, strides[0]/4, height, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, fds[0], offsets[0])), "DRI3: LorieBuffer_wrapAHardwareBuffer failed.");
