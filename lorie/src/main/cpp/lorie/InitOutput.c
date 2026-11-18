@@ -1020,7 +1020,12 @@ void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unu
     if (width == 0 || height == 0)
         return priv;
 
-    uint8_t type = usage_hint != CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED ? LORIEBUFFER_REGULAR : pvfb->root.legacyDrawing ? LORIEBUFFER_FD : LORIEBUFFER_AHARDWAREBUFFER;
+    Bool backed = usage_hint == CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED ||
+                  usage_hint == CREATE_PIXMAP_USAGE_BACKING_PIXMAP ||
+                  usage_hint == CREATE_PIXMAP_USAGE_SHARED;
+    uint8_t type = !backed ? LORIEBUFFER_REGULAR :
+                   (usage_hint == CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED && !pvfb->root.legacyDrawing) ?
+                   LORIEBUFFER_AHARDWAREBUFFER : LORIEBUFFER_FD;
     priv->buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, type);
     *new_fb_pitch = LorieBuffer_description(priv->buffer)->stride * 4;
 
@@ -1262,11 +1267,71 @@ static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_
 
 static int lorieDri3Open(unused ScreenPtr screen, unused RRProviderPtr provider, int *fd);
 
+static int lorieFdFromPixmap(ScreenPtr screen, PixmapPtr pixmap, CARD16 *stride, CARD32 *size) {
+    LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pixmap);
+    const LorieBuffer_Desc *desc;
+    int fd, out;
+    uint32_t byte_stride;
+
+    if (!priv || !priv->buffer)
+        return -1;
+
+    fd = LorieBuffer_getFd(priv->buffer);
+    if (fd < 0)
+        return -1;
+
+    desc = LorieBuffer_description(priv->buffer);
+    byte_stride = (uint32_t) desc->stride * 4;
+    if (byte_stride > 0xffff)
+        return -1;
+
+    out = dup(fd);
+    if (out < 0)
+        return -1;
+
+    *stride = (CARD16) byte_stride;
+    *size = (uint32_t) LorieBuffer_getSize(priv->buffer);
+    if (*size == 0)
+        *size = byte_stride * pixmap->drawable.height;
+
+    return out;
+}
+
+static int lorieFdsFromPixmap(ScreenPtr screen, PixmapPtr pixmap, int *fds,
+                              uint32_t *strides, uint32_t *offsets,
+                              uint64_t *modifier) {
+    LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pixmap);
+    const LorieBuffer_Desc *desc;
+    int fd, out;
+
+    if (!priv || !priv->buffer)
+        return 0;
+
+    fd = LorieBuffer_getFd(priv->buffer);
+    if (fd < 0)
+        return 0;
+
+    desc = LorieBuffer_description(priv->buffer);
+    out = dup(fd);
+    if (out < 0)
+        return 0;
+
+    fds[0] = out;
+    strides[0] = (uint32_t) desc->stride * 4;
+    offsets[0] = (uint32_t) LorieBuffer_getOffset(priv->buffer);
+    *modifier = DRM_FORMAT_MOD_LINEAR;
+
+    return 1;
+}
+
 static dri3_screen_info_rec lorieDri3Info = {
         .version = 2,
         .open = lorieDri3Open,
-        .fds_from_pixmap = FalseNoop,
+        .pixmap_from_fd = NULL,
+        .fd_from_pixmap = lorieFdFromPixmap,
+        .open_client = NULL,
         .pixmap_from_fds = loriePixmapFromFds,
+        .fds_from_pixmap = lorieFdsFromPixmap,
         .get_formats = lorieGetFormats,
         .get_modifiers = lorieGetModifiers,
         .get_drawable_modifiers = FalseNoop
