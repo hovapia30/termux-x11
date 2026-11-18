@@ -204,6 +204,24 @@ unsigned int LorieBuffer_getGLTextureId(LorieBuffer* _Nullable buffer);
  */
 bool LorieBuffer_isRgba(LorieBuffer* _Nullable buffer);
 
+/**
+ * Get the underlying file descriptor for an FD-backed buffer.
+ * Returns -1 if the buffer is not FD-backed.
+ */
+int LorieBuffer_getFd(LorieBuffer* _Nullable buffer);
+
+/**
+ * Get the underlying memory size for an FD-backed buffer.
+ * Returns 0 if the buffer is not FD-backed.
+ */
+size_t LorieBuffer_getSize(LorieBuffer* _Nullable buffer);
+
+/**
+ * Get the underlying memory offset for an FD-backed buffer.
+ * Returns 0 if the buffer is not FD-backed.
+ */
+off_t LorieBuffer_getOffset(LorieBuffer* _Nullable buffer);
+
 struct xorg_list;
 
 /**

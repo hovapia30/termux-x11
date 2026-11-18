@@ -13,11 +13,13 @@
 #include <pixman.h>
 #include <stdbool.h>
 #include <linux/memfd.h>
+#include <linux/dma-heap.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -76,7 +78,33 @@ static inline size_t alignToPage(size_t size) {
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "UnreachableCallsOfFunction"
 int LorieBuffer_createRegion(char const* name, size_t size) {
+    static const char *dma_heaps[] = {
+        "/dev/dma_heap/system",
+        "/dev/dma_heap/qcom,system",
+    };
     int fd = -1;
+
+    // Prefer dma-buf backed allocations so buffers can be exported/imported via
+    // DRI3 and Vulkan (e.g. Zink on Adreno). Fall back to shared memory if unavailable.
+    for (size_t i = 0; i < sizeof(dma_heaps) / sizeof(dma_heaps[0]); i++) {
+        int heap = open(dma_heaps[i], O_RDWR | O_CLOEXEC);
+        if (heap < 0)
+            continue;
+
+        struct dma_heap_allocation_data alloc = {
+            .len = size,
+            .fd_flags = O_RDWR | O_CLOEXEC,
+            .heap_flags = 0,
+        };
+
+        if (ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &alloc) == 0 && alloc.fd >= 0)
+            fd = alloc.fd;
+
+        close(heap);
+        if (fd >= 0)
+            return fd;
+    }
+
     if (__builtin_available(android 26, *))
         fd = ASharedMemory_create(name, size);
     if (fd >= 0)
@@ -180,9 +208,12 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocate(int32_t width, int32_t height,
     int fd = -1;
     size_t size = 0;
     AHardwareBuffer *ahardwarebuffer = NULL;
+    // Align stride to 64 pixels (256 bytes) to satisfy GPU dma-buf import
+    // requirements (e.g. Adreno linear image pitch constraints).
+    int32_t stride = (width + 63) & ~63;
 
     if (type == LORIEBUFFER_FD) {
-        size = alignToPage(width * height * sizeof(uint32_t));
+        size = alignToPage((size_t) stride * height * sizeof(uint32_t));
         fd = LorieBuffer_createRegion("LorieBuffer", size);
         if (fd < 0)
             return NULL;
@@ -196,7 +227,7 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocate(int32_t width, int32_t height,
             dprintf(2, "FATAL: failed to allocate AHardwareBuffer (width %d height %d format %d): error %d\n", width, height, format, err);
     }
 
-    return allocate(width, width, height, format, type, ahardwarebuffer, fd, size, 0, true);
+    return allocate(width, stride, height, format, type, ahardwarebuffer, fd, size, 0, true);
 }
 
 __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapFileDescriptor(int32_t width, int32_t stride, int32_t height, int8_t format, int fd, off_t offset) {
@@ -215,7 +246,7 @@ __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_
         return;
 
     if (type == LORIEBUFFER_FD) {
-        size_t size = alignToPage(buffer->desc.stride * buffer->desc.height * sizeof(uint32_t));
+        size_t size = alignToPage((size_t) buffer->desc.stride * buffer->desc.height * sizeof(uint32_t));
         int fd = LorieBuffer_createRegion("LorieBuffer", size);
         if (fd < 0)
             return;
@@ -478,6 +509,24 @@ __LIBC_HIDDEN__ unsigned int LorieBuffer_getGLTextureId(LorieBuffer *buffer) {
 
 __LIBC_HIDDEN__ bool LorieBuffer_isRgba(LorieBuffer *buffer) {
     return LorieBuffer_description(buffer)->format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
+}
+
+__LIBC_HIDDEN__ int LorieBuffer_getFd(LorieBuffer* buffer) {
+    if (!buffer || buffer->desc.type != LORIEBUFFER_FD)
+        return -1;
+    return buffer->fd;
+}
+
+__LIBC_HIDDEN__ size_t LorieBuffer_getSize(LorieBuffer* buffer) {
+    if (!buffer || buffer->desc.type != LORIEBUFFER_FD)
+        return 0;
+    return buffer->size;
+}
+
+__LIBC_HIDDEN__ off_t LorieBuffer_getOffset(LorieBuffer* buffer) {
+    if (!buffer || buffer->desc.type != LORIEBUFFER_FD)
+        return 0;
+    return buffer->offset;
 }
 
 __LIBC_HIDDEN__ void LorieBuffer_addToList(LorieBuffer* _Nullable buffer, struct xorg_list* _Nullable list) {
